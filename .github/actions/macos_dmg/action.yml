@@ -1,0 +1,135 @@
+name: 'Create macOS Application'
+description: 'Create and Sign macOS Application Using PyInstaller'
+inputs:
+  version:
+    description: 'Gaphor version number'
+    required: true
+  arch:
+    description: 'macOS architecture'
+    required: true
+  base64_encoded_p12:
+    description: 'base64_encoded_p12'
+    required: true
+  certpassword_p12:
+    description: 'certpassword_p12'
+    required: true
+  notary_username:
+    description: 'Username for notarizing'
+    required: true
+  notary_password:
+    description: 'Password for notarizing'
+    required: true
+  notary_team_id:
+    description: 'Team ID for notarizing'
+    required: true
+  sign_app:
+    description: 'Build is performed on the main line'
+    required: true
+outputs:
+  artifact:
+    description: 'Build artifact'
+    value: ${{ steps.dmg.outputs.artifact }}${{ steps.zip.outputs.artifact }}
+runs:
+  using: composite
+  steps:
+    - name: Ensure Homebrew Library Path
+      run: test ! -d /opt/homebrew/lib || echo "DYLD_LIBRARY_PATH=/opt/homebrew/lib" >> $GITHUB_ENV
+      shell: bash
+    - name: Install Build Dependencies
+      run: poetry install --only main,packaging --no-interaction
+      shell: bash
+    - name: Build Wheel
+      run: poetry build
+      shell: bash
+    - name: Create Unsigned macOS Application
+      if: inputs.sign_app != 'true'
+      run: poetry run poe package
+      shell: bash
+    - name: Import codesign certificate
+      if: inputs.sign_app == 'true'
+      env:
+        P12BASE64: ${{ inputs.base64_encoded_p12 }}
+        P12PASSWORD: ${{ inputs.certpassword_p12 }}
+      run: |
+        P12FILE=$(mktemp)
+        PASSWORD=$(openssl rand -base64 24)
+        security create-keychain -p "$PASSWORD" temp.keychain
+        echo "$P12BASE64" | base64 -D -o "$P12FILE"
+        security import "$P12FILE" -k temp.keychain -f pkcs12 -T /usr/bin/codesign -T /usr/bin/security -P "$P12PASSWORD"
+        rm -f "$P12FILE"
+        security set-key-partition-list -S "apple-tool:,apple:" -k "$PASSWORD" temp.keychain
+        security list-keychains -d user -s temp.keychain login.keychain
+      shell: bash
+    - name: Create Signed macOS Application
+      if: inputs.sign_app == 'true'
+      env:
+        CODESIGN_IDENTITY: "Developer ID Application: Daniel Yeaw (Z7V37BLNR9)"
+      run: poetry run poe package
+      shell: bash
+    - name: Store notary credentials
+      if: inputs.sign_app == 'true'
+      run: >
+        xcrun notarytool store-credentials "notarytool-profile"
+        --apple-id "${{ inputs.notary_username }}"
+        --team-id "${{ inputs.notary_team_id }}"
+        --password "${{ inputs.notary_password }}"
+      shell: bash
+    - name: Notarize app
+      if: inputs.sign_app == 'true'
+      env:
+        PRODUCT_PATH: "_packaging/dist/Gaphor.app"
+      run: |
+        ditto -c -k --keepParent "${{ env.PRODUCT_PATH }}" "notarization.zip"
+        xcrun notarytool submit "notarization.zip" --keychain-profile "notarytool-profile" --wait
+      shell: bash
+    - name: Staple app
+      if: inputs.sign_app == 'true'
+      env:
+        PRODUCT_PATH: "_packaging/dist/Gaphor.app"
+      run: xcrun stapler staple ${{ env.PRODUCT_PATH }}
+      shell: bash
+    - name: Create dmg
+      id: dmg
+      run: |
+        cd _packaging
+        # Improve hdiutil reliability
+        # https://github.com/actions/runner-images/issues/7522#issuecomment-1556766641
+        echo killing...; sudo pkill -9 XProtect >/dev/null || true;
+        echo waiting...; while pgrep XProtect; do sleep 3; done;
+        create-dmg --hdiutil-verbose --volname "Gaphor ${{ inputs.version }}-${{ inputs.arch }}" \
+        --background "macos/background.png" \
+        --window-pos 200 120 --window-size 700 400 --icon-size 100 \
+        --icon "Gaphor.app" 200 240 --hide-extension "Gaphor.app" \
+        --app-drop-link 500 240 "dist/Gaphor-${{ inputs.version }}-${{ inputs.arch }}.dmg" \
+        "dist/Gaphor.app"
+        echo "artifact=Gaphor-${{ inputs.version }}-${{ inputs.arch }}.dmg" >> $GITHUB_OUTPUT
+      shell: bash
+    - name: Notarize dmg
+      if: inputs.sign_app == 'true'
+      env:
+        PRODUCT_PATH: "_packaging/dist/Gaphor-${{ inputs.version }}-${{ inputs.arch }}.dmg"
+      run: |
+        ditto -c -k --keepParent "${{ env.PRODUCT_PATH }}" "notarization.zip"
+        xcrun notarytool submit "notarization.zip" --keychain-profile "notarytool-profile" --wait
+      shell: bash
+    - name: Staple .dmg
+      if: inputs.sign_app == 'true'
+      env:
+        PRODUCT_PATH: "_packaging/dist/Gaphor-${{ inputs.version }}-${{ inputs.arch }}.dmg"
+      run: xcrun stapler staple ${{ env.PRODUCT_PATH }}
+      shell: bash
+    - name: Delete temporary keychain
+      if: inputs.sign_app == 'true'
+      run: security delete-keychain temp.keychain
+      shell: bash
+    - name: Upload Gaphor-${{ inputs.version }}-${{ inputs.arch }}.dmg
+      uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+      with:
+        name: Gaphor-${{ inputs.version }}-${{ inputs.arch }}.dmg
+        path: _packaging/dist/Gaphor-${{ inputs.version }}-${{ inputs.arch }}.dmg
+    - name: Upload Assets (release only)
+      if: github.event_name == 'release'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh release upload ${{ inputs.version }} "_packaging/dist/Gaphor-${{ inputs.version }}-${{ inputs.arch }}.dmg"
+      shell: bash
